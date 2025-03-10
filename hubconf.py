@@ -13,8 +13,8 @@ def _create(name, pretrained=True, channels=3, classes=80, autoshape=True, verbo
         verbose (bool): print all information to screen
         device (str, torch.device, None): device to use for model parameters
 
-    Returns:
-        YOLO model
+    Returns:C:\\Users\\zhieu\\OneDrive\\Documents\\btl_xla\\yolov9\\Data_ext\\
+        YOLO model video.mp4
     """
     from pathlib import Path
 

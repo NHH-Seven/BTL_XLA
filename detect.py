@@ -18,7 +18,17 @@ from utils.general import (LOGGER, Profile, check_file, check_img_size, check_im
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from motmetrics import metrics
+import time
+from utils.metrics import box_iou
 
+# Biến đếm FPS
+start_time = time.time()
+frame_count = 0
+
+# Khởi tạo bộ theo dõi
+tracker = DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0)
 
 @smart_inference_mode()
 def run(
@@ -50,6 +60,9 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
 ):
+    global frame_count  # Sử dụng biến toàn cục frame_count
+    frame_count = 0  # Reset lại biến đếm
+    
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
@@ -84,7 +97,12 @@ def run(
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
+
+    # Khởi tạo accumulator cho metrics
+    acc = metrics.MetricsHost()
+
     for path, im, im0s, vid_cap, s in dataset:
+        frame_count += 1
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
             im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
@@ -101,18 +119,15 @@ def run(
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
         # Process predictions
-        for i, det in enumerate(pred):  # per image
-            seen += 1
+        for i, det in enumerate(pred):
+            # Get current frame info first
             if webcam:  # batch_size >= 1
                 p, im0, frame = path[i], im0s[i].copy(), dataset.count
                 s += f'{i}: '
             else:
                 p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
-
+            
             p = Path(p)  # to Path
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
@@ -120,6 +135,9 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            
+            # Now process detections
+            detections = []
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -129,8 +147,12 @@ def run(
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                # Write results
+                # Process each detection
                 for *xyxy, conf, cls in reversed(det):
+                    # Convert to list for DeepSORT
+                    xyxy_list = [coord.item() for coord in xyxy]
+                    detections.append((xyxy_list, conf.item(), int(cls.item())))
+                    
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -141,8 +163,55 @@ def run(
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
                         annotator.box_label(xyxy, label, color=colors(c, True))
+                    
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+
+            # Update tracks with DeepSORT
+            tracks = tracker.update_tracks(detections, frame=im0)
+            
+            # Draw tracks on the image
+            for track in tracks:
+                if track.is_confirmed() and track.time_since_update <= 1:
+                    track_box = track.to_tlbr()
+                    track_id = track.track_id
+                    
+                    # Convert to PyTorch tensor format for box_label
+                    track_xyxy = torch.tensor([track_box[0], track_box[1], track_box[2], track_box[3]])
+                    
+                    # Draw track ID
+                    label = f"ID: {track_id}"
+                    annotator.box_label(track_xyxy, label, color=(0, 255, 0))  # Green color for tracks
+                    
+                    # Calculate IoU with all detections (if any)
+                    if len(det):
+                        ious = []
+                        for *xyxy, _, _ in reversed(det):
+                            iou = box_iou(torch.tensor(track_box).unsqueeze(0), 
+                                         torch.tensor([coord.item() for coord in xyxy]).unsqueeze(0))
+                            ious.append(iou.item())
+                        
+                        if ious:
+                            avg_iou = sum(ious) / len(ious)
+                            print(f"📏 Track ID {track_id} IoU: {avg_iou:.2f}")
+
+            # Try to calculate metrics if we have detections
+            try:
+                if len(tracks) > 0:
+                    # Note: proper MOTA and IDF1 calculation requires ground truth data
+                    # This is a simplified approximation
+                    summary = metrics.compute_many(
+                        [acc],
+                        metrics=['num_frames', 'mota', 'idf1'], 
+                        names=['Summary']
+                    )
+                    
+                    if 'mota' in summary.columns and 'idf1' in summary.columns:
+                        mota = summary['mota'].iloc[0] 
+                        idf1 = summary['idf1'].iloc[0]
+                        print(f"✅ MOTA: {mota:.2f}, IDF1: {idf1:.2f}")
+            except Exception as e:
+                print(f"⚠️ Metrics calculation error: {e}")
 
             # Stream results
             im0 = annotator.result()
@@ -178,6 +247,11 @@ def run(
 
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
+    end_time = time.time()
+    total_time = end_time - start_time
+    fps = frame_count / total_time if total_time > 0 else 0
+    print(f"⚡ Processed {frame_count} frames in {total_time:.2f} seconds - FPS: {fps:.2f}")
+
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''

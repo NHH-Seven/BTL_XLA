@@ -12,7 +12,7 @@ import os
 torch.serialization.add_safe_globals([DetectionModel])
 
 # Config value
-video_path = "C:\\Users\\zhieu\\OneDrive\\Documents\\btl_xla\\yolov9\\Data_ext\\CarsPassing.mp4"
+video_path = "C:\\Users\\zhieu\\OneDrive\\Documents\\btl_xla\\yolov9\\Data_ext\\CarsMoving.mp4"
 conf_threshold = 0.5
 tracking_class = None  # None để theo dõi tất cả các lớp đối tượng
 
